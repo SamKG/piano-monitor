@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.98"
 cpal = { version = "0.15.3", features = ["jack"] }
 env_logger = "0.11.8"
+jack = "0.13.3"
 log = "0.4.27"
 midir = "0.10.1"
 num-traits = "0.2.19"

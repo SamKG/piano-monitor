@@ -1,13 +1,15 @@
 mod audio;
+mod jack_boot;
 mod midi;
 mod monitor;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use env_logger::Env;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 
 fn main() -> Result<()> {
+    jack_boot::ensure_jack_running(std::time::Duration::from_secs(3)).context("starting JACK")?;
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let sf_path: PathBuf = std::env::var("SOUNDFONT")
