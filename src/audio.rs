@@ -52,7 +52,7 @@ impl AudioEngine {
         let mut synth = {
             let desc = SynthDescriptor {
                 sample_rate,
-                gain: 1.0,
+                gain: 2.0,
                 ..Default::default()
             };
             let mut s = Synth::new(desc).map_err(|e| anyhow!("synth init: {e:?}"))?;
