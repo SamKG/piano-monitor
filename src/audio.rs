@@ -1,4 +1,7 @@
 //! Owns the OxiSynth instance and the CPAL output stream.
+//! Latency-tuned: 32-frame request, zero-copy fast path, no assumptions about
+//! actual buffer length.
+
 use anyhow::{Context, Result, anyhow};
 use cpal::{
     BufferSize, HostId, Sample, SampleFormat, SizedSample, Stream, StreamConfig, host_from_id,
@@ -7,38 +10,74 @@ use cpal::{
 use oxisynth::{MidiEvent, SoundFont, Synth, SynthDescriptor};
 use std::{fs::File, path::Path, sync::mpsc::Receiver};
 
+/// We *request* 32 frames (≈0.67 ms @ 48 kHz) but must cope with anything.
+const REQUESTED_FRAMES: u32 = 32;
+
 pub struct AudioEngine {
     _stream: Stream,
 }
 
 impl AudioEngine {
     pub fn start(rx: Receiver<MidiEvent>, font_path: &Path) -> Result<Self> {
-        // ----- prefer JACK; fall back to whatever default_host() gives -----
+        // Prefer JACK; fall back to default host.
         let host = host_from_id(HostId::Jack).unwrap_or_else(|_| cpal::default_host());
-
         let device = host
             .default_output_device()
             .context("no default output device")?;
 
-        // default config → customised StreamConfig (64-frame fixed buffer)
         let def_cfg = device.default_output_config()?;
         let sample_format = def_cfg.sample_format();
         let mut stream_cfg: StreamConfig = def_cfg.into();
-        stream_cfg.buffer_size = BufferSize::Fixed(64); // <<< tiny block
+        stream_cfg.buffer_size = BufferSize::Fixed(REQUESTED_FRAMES);
 
-        // choose the concrete stream implementation
         let stream = match sample_format {
-            SampleFormat::F32 => Self::run::<f32>(&device, &stream_cfg, rx, font_path)?,
-            SampleFormat::I16 => Self::run::<i16>(&device, &stream_cfg, rx, font_path)?,
-            SampleFormat::U16 => Self::run::<u16>(&device, &stream_cfg, rx, font_path)?,
-            _ => unreachable!("unknown sample format"),
+            SampleFormat::F32 => Self::run_f32(&device, &stream_cfg, rx, font_path)?,
+            SampleFormat::I16 | SampleFormat::U16 => {
+                Self::run_generic::<i16>(&device, &stream_cfg, rx, font_path)?
+            }
+            _ => unreachable!("unexpected CPAL sample format"),
         };
 
         stream.play()?;
         Ok(Self { _stream: stream })
     }
 
-    fn run<T>(
+    // ─────────────────────────── f32 fast path ─────────────────────────── //
+
+    fn run_f32(
+        device: &cpal::Device,
+        cfg: &StreamConfig,
+        rx: Receiver<MidiEvent>,
+        font_path: &Path,
+    ) -> Result<Stream> {
+        let channels = cfg.channels as usize;
+        let mut synth = new_synth(cfg.sample_rate.0 as f32, font_path)?;
+
+        let err_fn = |e| log::error!("audio stream error: {e}");
+        let stream = device.build_output_stream(
+            cfg,
+            move |output: &mut [f32], _| {
+                while let Ok(ev) = rx.try_recv() {
+                    synth.send_event(ev).ok();
+                }
+
+                for frame in output.chunks_mut(channels) {
+                    let (l, r) = synth.read_next();
+                    frame[0] = l;
+                    if channels > 1 {
+                        frame[1] = r;
+                    }
+                }
+            },
+            err_fn,
+            None,
+        )?;
+        Ok(stream)
+    }
+
+    // ─────────────── generic path for I16 / U16 sample formats ─────────── //
+
+    fn run_generic<T>(
         device: &cpal::Device,
         cfg: &StreamConfig,
         rx: Receiver<MidiEvent>,
@@ -47,35 +86,17 @@ impl AudioEngine {
     where
         T: Sample + SizedSample + num_traits::cast::FromPrimitive,
     {
-        // ---- initialise the synth ----
-        let sample_rate = cfg.sample_rate.0 as f32;
-        let mut synth = {
-            let desc = SynthDescriptor {
-                sample_rate,
-                gain: 2.0,
-                ..Default::default()
-            };
-            let mut s = Synth::new(desc).map_err(|e| anyhow!("synth init: {e:?}"))?;
-            let mut file = File::open(font_path)
-                .with_context(|| format!("open sound-font {:?}", font_path))?;
-            let font = SoundFont::load(&mut file)
-                .map_err(|_| anyhow!("load sound-font {:?}", font_path))?;
-            s.add_font(font, true);
-            s.set_sample_rate(sample_rate);
-            s
-        };
-
         let channels = cfg.channels as usize;
-        let err_fn = |e| log::error!("audio stream error: {e}");
+        let mut synth = new_synth(cfg.sample_rate.0 as f32, font_path)?;
 
+        let err_fn = |e| log::error!("audio stream error: {e}");
         let stream = device.build_output_stream(
             cfg,
             move |output: &mut [T], _| {
-                // drain any pending MIDI events
                 while let Ok(ev) = rx.try_recv() {
                     synth.send_event(ev).ok();
                 }
-                // render one buffer of audio
+
                 for frame in output.chunks_mut(channels) {
                     let (l, r) = synth.read_next();
                     frame[0] = T::from_f32(l).unwrap();
@@ -87,7 +108,25 @@ impl AudioEngine {
             err_fn,
             None,
         )?;
-
         Ok(stream)
     }
+}
+
+// ───────────────────────────── helpers ─────────────────────────────────── //
+
+fn new_synth(sample_rate: f32, font_path: &Path) -> Result<Synth> {
+    let desc = SynthDescriptor {
+        sample_rate,
+        gain: 2.0,
+        ..Default::default()
+    };
+    let mut synth = Synth::new(desc).map_err(|e| anyhow!("synth init: {e:?}"))?;
+
+    let mut file =
+        File::open(font_path).with_context(|| format!("open sound-font {:?}", font_path))?;
+    let font =
+        SoundFont::load(&mut file).map_err(|_| anyhow!("load sound-font {:?}", font_path))?;
+    synth.add_font(font, true);
+    synth.set_sample_rate(sample_rate);
+    Ok(synth)
 }

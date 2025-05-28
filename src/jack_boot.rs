@@ -18,7 +18,7 @@ fn jack_is_running() -> bool {
 /// Start a JACK server with the command you like.  Return as soon as the
 /// daemon process itself has spawned (not when the graph is ready).
 fn spawn_jackd() -> Result<()> {
-    println!("Starting JACK server...");
+    log::info!("Starting JACK server...");
     // Example command line – customise to taste or pull from a config file.
     let cmd = [
         "jackd", "-P85", // RT priority
@@ -42,7 +42,7 @@ fn spawn_jackd() -> Result<()> {
 /// ready (or bail after `timeout`).
 pub fn ensure_jack_running(timeout: Duration) -> Result<()> {
     if jack_is_running() {
-        println!("JACK server is already running.");
+        log::info!("JACK server is already running.");
         return Ok(());
     }
 
@@ -52,7 +52,7 @@ pub fn ensure_jack_running(timeout: Duration) -> Result<()> {
 
     // ── poll until the server answers ────────────────────────────────────────
     loop {
-        println!("Waiting for JACK server...");
+        log::info!("Waiting for JACK server...");
         if jack_is_running() {
             return Ok(());
         }
